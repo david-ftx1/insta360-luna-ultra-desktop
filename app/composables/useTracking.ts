@@ -251,12 +251,18 @@ export function useTracking() {
    * describes one lock, and whether the camera itself remembers it across locks
    * is unknown.
    */
-  const framingIndex = useState<number | null>("tracking-framing-index", () => null);
+  // Defaults to the middle box (shown green in the picker), as in the iPhone
+  // app. Changed 2026-10-21 at David's request: it used to start as null, so
+  // the first lock showed nine white boxes.
+  const framingIndex = useState<number | null>(
+    "tracking-framing-index",
+    () => FRAMING_CENTRE_INDEX,
+  );
   const framingPickerOpen = useState<boolean>("tracking-framing-picker-open", () => false);
   const framingNote = useState<string | null>("tracking-framing-note", () => null);
 
   function resetFraming() {
-    framingIndex.value = null;
+    framingIndex.value = FRAMING_CENTRE_INDEX;
     framingPickerOpen.value = false;
     framingNote.value = null;
   }
@@ -394,6 +400,34 @@ export function useTracking() {
        */
       const modeId = useState<string>("camera-capture-mode", () => "video");
       watch(modeId, () => {
+        const sentCustomPoint =
+          framingIndex.value !== null && framingIndex.value !== FRAMING_CENTRE_INDEX;
+        if (enabled.value) void toggle();
+        framingIndex.value = FRAMING_CENTRE_INDEX;
+        const centre = FRAMING_POINTS[FRAMING_CENTRE_INDEX];
+        if (sentCustomPoint && centre) void sendTrackingFramingCandidate(centre).catch(() => {});
+      });
+
+      /**
+       * ADDED 2026-10-21: David asked for Deep Track to switch off whenever the
+       * gimbal closes — e.g. leaving the Camera page for Settings, Gallery,
+       * Downloads or Connection. The gimbal closes when the live view is
+       * stopped with `useLiveView().stop()`, which sends the view-mode change
+       * (see its comment on `pause()`, which deliberately does NOT — that one
+       * only interrupts the stream for a resolution change, the gimbal stays
+       * and so does tracking). `stop()` bumps `liveview-stop-count`; this
+       * watches it. That one hook covers leaving the page, the camera
+       * disconnecting and a failed preview start, without each page needing to
+       * know about tracking. Goes through toggle(), same as the button and the
+       * mode-change watcher above. useLiveView.ts waits a tick after bumping
+       * the counter so this runs — and the close-tracking command goes out —
+       * before the view-mode change does.
+       */
+      const liveViewStopCount = useState<number>("liveview-stop-count", () => 0);
+      watch(liveViewStopCount, () => {
+        // Same end state as the mode-change watcher above: selector back on the
+        // middle box (shown green), and the camera told if it was holding a
+        // different point. toggle() clears the selection, so set it after.
         const sentCustomPoint =
           framingIndex.value !== null && framingIndex.value !== FRAMING_CENTRE_INDEX;
         if (enabled.value) void toggle();

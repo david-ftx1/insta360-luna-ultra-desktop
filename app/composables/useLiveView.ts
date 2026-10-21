@@ -14,6 +14,9 @@ export function useLiveView() {
   const transport = useState<LiveTransport | null>("liveview-transport", () => null);
   const streamUrl = useState<string | null>("liveview-url", () => null);
   const error = useState<string | null>("liveview-error", () => null);
+  /** Bumped by every stop() — NOT by pause() — so useTracking.ts can switch
+   * Deep Track off when the gimbal closes. Only ever read as "did it change". */
+  const stopCount = useState<number>("liveview-stop-count", () => 0);
   const diagnostics = useState<string[]>("liveview-diagnostics", () => []);
 
   const note = (line: string) => {
@@ -68,6 +71,10 @@ export function useLiveView() {
   }
 
   async function stop() {
+    // Tell useTracking.ts first, and give it a tick to act, so tracking is
+    // closed before the view-mode change below parks the gimbal.
+    stopCount.value++;
+    await nextTick();
     active.value = false;
     transport.value = null;
     streamUrl.value = null;
