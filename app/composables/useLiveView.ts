@@ -76,6 +76,56 @@ export function useLiveView() {
       .catch(() => {});
   }
 
+  /**
+   * Interrupt the stream for a moment without the view-mode round trip
+   * `stop()` sends — see `liveViewPause` on `CameraTransport`. Use this when
+   * the app itself needs the stream out of the way briefly (e.g.
+   * `useCameraSettings.setResolution`, which the camera refuses to apply
+   * with a stream attached); use `stop()` for the user actually navigating
+   * away. Falls back to the ordinary `stop()` on a transport with no
+   * `liveViewPause` (the docs-site mock).
+   */
+  async function pause() {
+    if (!active.value) return;
+    const camTransport = getCameraTransport();
+    active.value = false;
+    transport.value = null;
+    streamUrl.value = null;
+    if (camTransport.liveViewPause) {
+      await camTransport.liveViewPause().catch(() => {});
+    } else {
+      await camTransport.liveViewStop().catch(() => {});
+    }
+  }
+
+  /** The other half of `pause()`. Falls back to `start()`'s full OSC-probe
+   * dance plus view-mode transition on a transport with no `liveViewResume`. */
+  async function resume() {
+    if (starting.value || active.value) return;
+    if (!isConnected.value) {
+      error.value = "Connect to the camera first.";
+      return;
+    }
+    const camTransport = getCameraTransport();
+    if (!camTransport.liveViewResume) {
+      await start();
+      return;
+    }
+    starting.value = true;
+    error.value = null;
+    try {
+      const info = await camTransport.liveViewResume();
+      transport.value = "annexb";
+      streamUrl.value = info.url;
+      active.value = true;
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : String(cause);
+      note(`Failed to resume: ${error.value}`);
+    } finally {
+      starting.value = false;
+    }
+  }
+
   async function refreshStats(): Promise<LiveViewStats | null> {
     if (!active.value) return null;
     return getCameraTransport()
@@ -93,6 +143,8 @@ export function useLiveView() {
     note,
     start,
     stop,
+    pause,
+    resume,
     refreshStats,
   };
 }

@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Luna Ultra — Live View</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: #000;
+        overflow: hidden;
+      }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      canvas {
+        display: block;
+        max-width: 100vw;
+        max-height: 100vh;
+        width: auto;
+        height: auto;
+      }
+      #status {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        padding: 6px 10px;
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.55);
+        color: rgba(255, 255, 255, 0.85);
+        font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        backdrop-filter: blur(6px);
+        pointer-events: none;
+        white-space: pre-wrap;
+        max-width: 70vw;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="status">Connecting…</div>
+
+    <script>
+      "use strict";
+
+      /**
+       * Luna Ultra Live View — standalone browser page.
+       *
+       * This exists because this camera's HEVC stream decodes fine with
+       * WebCodecs in a real browser, but fails inside this app's own embedded
+       * WKWebView (see the app's Live View diagnostics panel for the gory
+       * details — in short, WKWebView's hardware media decode appears to be
+       * gated behind a RunningBoard entitlement Apple does not grant to
+       * third-party apps, regardless of signing). Rather than depending on
+       * the embedded view's software decoder, the app opens this page in the
+       * system's default browser instead, where native hardware decode just
+       * works.
+       *
+       * Everything below is a deliberately simplified, dependency-free port
+       * of this app's own `app/utils/annexB.ts` NAL-parsing logic and
+       * `LiveView.vue`'s native-decode path — simplified because a real
+       * browser needs none of the WKWebView-specific fallback machinery
+       * (software WASM decode, hardwareAcceleration probing, capture-to-disk
+       * diagnostics). Kept in sync by hand since this file is served
+       * directly by the Rust side (see `liveview.rs`) rather than built
+       * through the app's own Vite/Nuxt pipeline, so it has no access to
+       * that TypeScript source — if the camera's stream format ever changes,
+       * update both places.
+       */
+
+      const START_CODE = new Uint8Array([0, 0, 0, 1]);
+
+      // H.265 parameter sets: VPS, SPS, PPS.
+      const H265_VPS = 32;
+      const H265_SPS = 33;
+      const H265_PPS = 34;
+      // H.265 IRAP range (BLA_W_LP..CRA_NUT) — any of these starts a keyframe.
+      const H265_IRAP_MIN = 16;
+      const H265_IRAP_MAX = 23;
+      // H.265 NAL types below this are VCL (picture data).
+      const H265_VCL_MAX = 31;
+
+      const H264_SPS = 7;
+      const H264_PPS = 8;
+      const H264_IDR = 5;
+      const H264_NON_IDR = 1;
+
+      /** Split a raw Annex-B stream into NAL payloads, start codes removed. */
+      function splitNalUnits(bytes) {
+        const units = [];
+        const length = bytes.length;
+        let from = -1;
+        for (let i = 0; i + 2 < length; i++) {
+          if (bytes[i] !== 0 || bytes[i + 1] !== 0) continue;
+          let size;
+          if (bytes[i + 2] === 1) size = 3;
+          else if (bytes[i + 2] === 0 && bytes[i + 3] === 1) size = 4;
+          else continue;
+          if (from >= 0 && i > from) units.push(bytes.subarray(from, i));
+          from = i + size;
+          i += size - 1;
+        }
+        if (from >= 0 && length > from) units.push(bytes.subarray(from, length));
+        return units;
+      }
+
+      /** Remove emulation prevention bytes (0x03 after any 0x00 0x00 pair). */
+      function unescapeRbsp(unit) {
+        const out = new Uint8Array(unit.length);
+        let written = 0;
+        let zeros = 0;
+        for (const byte of unit) {
+          if (zeros === 2 && byte === 0x03) {
+            zeros = 0;
+            continue;
+          }
+          out[written++] = byte;
+          zeros = byte === 0 ? zeros + 1 : 0;
+        }
+        return out.subarray(0, written);
+      }
+
+      function nalType(unit, codec) {
+        if (unit.length === 0) return -1;
+        return codec === "h265" ? (unit[0] >> 1) & 0x3f : unit[0] & 0x1f;
+      }
+
+      function detectCodec(units) {
+        for (const unit of units) {
+          if (unit.length === 0 || (unit[0] & 0x80) !== 0) continue;
+          const h265 = (unit[0] >> 1) & 0x3f;
+          if (h265 === H265_VPS || h265 === H265_SPS || h265 === H265_PPS) return "h265";
+          const h264 = unit[0] & 0x1f;
+          if (h264 === H264_SPS || h264 === H264_PPS) return "h264";
+        }
+        return null;
+      }
+
+      function findSps(units, codec) {
+        return units.find((unit) => nalType(unit, codec) === (codec === "h265" ? H265_SPS : H264_SPS));
+      }
+
+      const hex = (value) => value.toString(16).padStart(2, "0");
+
+      /** Reverse a 32-bit value bit-by-bit, as the HEVC codec string requires. */
+      function reverseBits32(value) {
+        let out = 0;
+        for (let bit = 0; bit < 32; bit++) {
+          out = ((out << 1) | ((value >>> bit) & 1)) >>> 0;
+        }
+        return out >>> 0;
+      }
+
+      function buildCodecString(units, codec) {
+        const raw = findSps(units, codec);
+        if (!raw) return null;
+        const sps = unescapeRbsp(raw);
+
+        if (codec === "h264") {
+          if (sps.length < 4) return null;
+          return `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`;
+        }
+
+        if (sps.length < 15) return null;
+
+        const profileByte = sps[3];
+        const profileSpace = (profileByte >> 6) & 0x03;
+        const tierFlag = (profileByte >> 5) & 0x01;
+        const profileIdc = profileByte & 0x1f;
+
+        const compatibility = ((sps[4] << 24) | (sps[5] << 16) | (sps[6] << 8) | sps[7]) >>> 0;
+
+        const constraints = [];
+        for (let i = 8; i < 14; i++) constraints.push(hex(sps[i]).toUpperCase());
+        while (constraints.length > 0 && constraints[constraints.length - 1] === "00") constraints.pop();
+
+        const space = profileSpace === 0 ? "" : String.fromCharCode(64 + profileSpace);
+        const tier = tierFlag === 0 ? "L" : "H";
+
+        const parts = [
+          `hvc1.${space}${profileIdc}`,
+          reverseBits32(compatibility).toString(16),
+          `${tier}${sps[14]}`,
+          ...constraints,
+        ];
+        return parts.join(".");
+      }
+
+      /** HEVCDecoderConfigurationRecord bytes, used only if a bare codec string is rejected. */
+      function buildHevcDescription(units) {
+        const vps = units.find((unit) => nalType(unit, "h265") === H265_VPS);
+        const rawSps = findSps(units, "h265");
+        const pps = units.find((unit) => nalType(unit, "h265") === H265_PPS);
+        if (!vps || !rawSps || !pps) return null;
+
+        const sps = unescapeRbsp(rawSps);
+        if (sps.length < 15) return null;
+
+        const header = new Uint8Array(23);
+        header[0] = 1;
+        header[1] = sps[3];
+        header.set([sps[4], sps[5], sps[6], sps[7]], 2);
+        header.set(sps.subarray(8, 14), 6);
+        header[12] = sps[14];
+        header[13] = 0xf0;
+        header[14] = 0x00;
+        header[15] = 0xfc;
+        header[16] = 0xfd;
+        header[17] = 0xf8;
+        header[18] = 0xf8;
+        header[19] = 0x00;
+        header[20] = 0x00;
+        header[21] = 0x03;
+        header[22] = 3;
+
+        const arrays = [
+          { type: H265_VPS, unit: vps },
+          { type: H265_SPS, unit: rawSps },
+          { type: H265_PPS, unit: pps },
+        ].map(({ type, unit }) => {
+          const out = new Uint8Array(5 + unit.length);
+          out[0] = 0x80 | type;
+          out[1] = 0;
+          out[2] = 1;
+          out[3] = (unit.length >> 8) & 0xff;
+          out[4] = unit.length & 0xff;
+          out.set(unit, 5);
+          return out;
+        });
+
+        const record = new Uint8Array(header.length + arrays.reduce((n, a) => n + a.length, 0));
+        record.set(header, 0);
+        let at = header.length;
+        for (const array of arrays) {
+          record.set(array, at);
+          at += array.length;
+        }
+        return record;
+      }
+
+      const isVcl = (type, codec) =>
+        codec === "h265" ? type <= H265_VCL_MAX : type === H264_IDR || type === H264_NON_IDR;
+      const isKeyNal = (type, codec) =>
+        codec === "h265" ? type >= H265_IRAP_MIN && type <= H265_IRAP_MAX : type === H264_IDR;
+
+      function packedSize(unit, framing) {
+        return (framing === "annexb" ? START_CODE.length : 4) + unit.length;
+      }
+
+      function packNal(unit, framing, out, at) {
+        if (framing === "annexb") {
+          out.set(START_CODE, at);
+          out.set(unit, at + START_CODE.length);
+          return at + START_CODE.length + unit.length;
+        }
+        const { length } = unit;
+        out[at] = (length >>> 24) & 0xff;
+        out[at + 1] = (length >>> 16) & 0xff;
+        out[at + 2] = (length >>> 8) & 0xff;
+        out[at + 3] = length & 0xff;
+        out.set(unit, at + 4);
+        return at + 4 + length;
+      }
+
+      function startsPicture(unit, codec) {
+        const offset = codec === "h265" ? 2 : 1;
+        if (unit.length <= offset) return false;
+        return (unit[offset] & 0x80) !== 0;
+      }
+
+      function drainAccessUnits(units, codec, framing) {
+        const pictureStarts = [];
+        for (let i = 0; i < units.length; i++) {
+          const type = nalType(units[i], codec);
+          if (isVcl(type, codec) && startsPicture(units[i], codec)) pictureStarts.push(i);
+        }
+        if (pictureStarts.length < 2) return { access: [], pending: units };
+
+        const cut = pictureStarts[pictureStarts.length - 1];
+        let from = cut;
+        while (from > 0 && !isVcl(nalType(units[from - 1], codec), codec)) from--;
+
+        return {
+          access: groupAccessUnits(units.slice(0, from), codec, framing),
+          pending: units.slice(from),
+        };
+      }
+
+      function groupAccessUnits(units, codec, framing) {
+        const access = [];
+        let pending = [];
+        let key = false;
+        let seenVcl = false;
+
+        const flush = () => {
+          if (!seenVcl || pending.length === 0) return;
+          const toPack =
+            framing === "annexb" ? pending : pending.filter((u) => isVcl(nalType(u, codec), codec));
+          const size = toPack.reduce((total, unit) => total + packedSize(unit, framing), 0);
+          const data = new Uint8Array(size);
+          let at = 0;
+          for (const unit of toPack) at = packNal(unit, framing, data, at);
+          access.push({ key, data });
+          pending = [];
+          key = false;
+          seenVcl = false;
+        };
+
+        for (const unit of units) {
+          const type = nalType(unit, codec);
+          if (isVcl(type, codec) && startsPicture(unit, codec) && seenVcl) flush();
+          if (isVcl(type, codec)) {
+            seenVcl = true;
+            if (isKeyNal(type, codec)) key = true;
+          }
+          pending.push(unit);
+        }
+        flush();
+        return access;
+      }
+
+      // --- Decode + paint -------------------------------------------------
+
+      const canvas = document.getElementById("canvas");
+      const statusEl = document.getElementById("status");
+      const ctx2d = canvas.getContext("2d");
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      let decoder = null;
+      let carry = new Uint8Array(0);
+      let pendingUnits = [];
+      let codec = null;
+      let configured = false;
+      let seenKeyframe = false;
+      let framing = "annexb";
+      let timestamp = 0;
+
+      function paint(frame) {
+        if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+        if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
+        ctx2d.drawImage(frame, 0, 0);
+        frame.close();
+      }
+
+      function resetDecoderState() {
+        try {
+          decoder?.close();
+        } catch {
+          // Already closed; nothing to do.
+        }
+        decoder = null;
+        pendingUnits = [];
+        codec = null;
+        configured = false;
+        seenKeyframe = false;
+        framing = "annexb";
+      }
+
+      /**
+       * Configure a native decoder for `codecString`. No hardwareAcceleration
+       * preference is set — unlike the embedded app's own attempt, a real
+       * browser's default ("no-preference") already picks hardware decode
+       * when available, which is the entire point of this page existing.
+       */
+      async function configureDecoder(codecString) {
+        const decoderInit = {
+          output: paint,
+          error: (cause) => {
+            setStatus(`Decoder error, resyncing at next keyframe: ${cause.message}`);
+            resetDecoderState();
+          },
+        };
+        decoder = new VideoDecoder(decoderInit);
+        try {
+          decoder.configure({ codec: codecString, optimizeForLatency: true });
+          framing = "annexb";
+          setStatus(`Streaming — ${codecString}`);
+          return;
+        } catch (bareCause) {
+          const description = codec === "h265" ? buildHevcDescription(pendingUnits) : null;
+          if (!description) {
+            const message = `This browser rejected "${codecString}": ${bareCause.message ?? bareCause}`;
+            setStatus(message);
+            throw new Error(message);
+          }
+          try {
+            decoder.close();
+          } catch {
+            // Already closed; nothing to do.
+          }
+          decoder = new VideoDecoder(decoderInit);
+          try {
+            decoder.configure({ codec: codecString, description, optimizeForLatency: true });
+            framing = "length4";
+            setStatus(`Streaming — ${codecString} (explicit description)`);
+          } catch (describedCause) {
+            const message = `This browser rejected "${codecString}" even with an explicit description: ${
+              describedCause.message ?? describedCause
+            }`;
+            setStatus(message);
+            throw new Error(message);
+          }
+        }
+      }
+
+      async function readLoop(reader) {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+
+          const merged = new Uint8Array(carry.length + value.length);
+          merged.set(carry);
+          merged.set(value, carry.length);
+
+          const units = splitNalUnits(merged);
+          if (units.length === 0) {
+            carry = merged;
+            continue;
+          }
+          const tail = units[units.length - 1];
+          carry = new Uint8Array(4 + tail.length);
+          carry.set([0, 0, 0, 1]);
+          carry.set(tail, 4);
+          for (const unit of units.slice(0, -1)) pendingUnits.push(unit.slice());
+          if (pendingUnits.length === 0) continue;
+
+          if (!codec) codec = detectCodec(pendingUnits);
+          if (!codec) continue;
+
+          if (!configured) {
+            const codecString = buildCodecString(pendingUnits, codec);
+            if (!codecString) continue;
+            setStatus(`Detected ${codec}, configuring decoder…`);
+            try {
+              await configureDecoder(codecString);
+            } catch {
+              return; // setStatus() above already explains why.
+            }
+            configured = true;
+          }
+
+          const { access, pending } = drainAccessUnits(pendingUnits, codec, framing);
+          pendingUnits = pending;
+
+          for (const unit of access) {
+            if (decoder?.state !== "configured") break;
+            if (!unit.key && !seenKeyframe) continue;
+            if (unit.key) seenKeyframe = true;
+            decoder.decode(
+              new EncodedVideoChunk({
+                type: unit.key ? "key" : "delta",
+                timestamp,
+                data: unit.data,
+              }),
+            );
+            timestamp += 33333; // ~30fps in microseconds
+          }
+        }
+      }
+
+      async function start() {
+        setStatus("Connecting…");
+        try {
+          const response = await fetch("stream");
+          const reader = response.body?.getReader();
+          if (!reader) throw new Error("the local stream returned no body");
+          await readLoop(reader);
+          setStatus("Stream ended.");
+        } catch (cause) {
+          setStatus(`Failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+        }
+      }
+
+      start();
+    </script>
+  </body>
+</html>

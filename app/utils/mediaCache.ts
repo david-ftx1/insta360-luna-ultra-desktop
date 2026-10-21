@@ -34,6 +34,11 @@ export interface MediaCache {
   has(key: string): boolean;
   /** Total tracked bytes currently held. */
   bytes(): number;
+  /**
+   * Drop specific entries (and any in-flight load for them). Safe to call
+   * with keys that were never cached — a miss is simply ignored.
+   */
+  forget(keys: string[]): void;
   clear(): void;
 }
 
@@ -99,6 +104,17 @@ export function createMediaCache(budgetBytes: number): MediaCache {
       return total;
     },
 
+    forget(keys: string[]): void {
+      for (const key of keys) {
+        const entry = entries.get(key);
+        if (entry) {
+          entries.delete(key);
+          total -= entry.bytes;
+        }
+        inFlight.delete(key);
+      }
+    },
+
     clear(): void {
       entries.clear();
       inFlight.clear();
@@ -130,6 +146,15 @@ export function cachedMedia<T extends CachedMedia>(
  */
 export function hasCachedMedia(key: string): boolean {
   return mediaCache.has(key);
+}
+
+/**
+ * Drop specific entries — e.g. a thumbnail whose source file has been
+ * deleted from the camera. Unlike {@link clearCachedMedia}, this leaves
+ * every other entry (and any in-flight load for a different key) alone.
+ */
+export function forgetCachedMedia(keys: string[]): void {
+  mediaCache.forget(keys);
 }
 
 /** Drop every entry. Intended for tests and teardown. */

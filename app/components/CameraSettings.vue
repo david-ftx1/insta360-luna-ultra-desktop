@@ -17,6 +17,7 @@ const {
   status,
   update,
   updateDevice,
+  setResolution,
   setWhiteBalance,
   setColorMode,
   setFilter,
@@ -112,6 +113,9 @@ const apply = (control: Control, value: ProtoValue) => {
   // camera stores them without applying while it is in i-Log
   if (control.field === "gamma_mode") return setFilter(String(value));
   if (control.field === "filter_intensity") return setFilterIntensity(String(value));
+  // A frame-size change here hits the same camera refusal the pro bar's
+  // RES/FPS/RATIO chips do while Live View is streaming — see setResolution.
+  if (control.field === "record_resolution") return setResolution(String(value));
   return control.scope === "device"
     ? updateDevice(control.option, control.field, value)
     : update(control.option, control.field, value);

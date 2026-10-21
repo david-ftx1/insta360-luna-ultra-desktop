@@ -34,6 +34,7 @@ const {
   saving,
   status,
   update,
+  setResolution,
   setExposure,
   setWhiteBalanceKelvin,
   setColorMode,
@@ -192,7 +193,7 @@ function chooseResolution(next: Partial<{ size: string; aspect: string; fps: num
   const fps = rates.includes(next.fps ?? from.fps) ? (next.fps ?? from.fps) : rates[0]!;
 
   const name = composeResolution(size, aspect, fps);
-  if (name) void update("RECORD_RESOLUTION", "record_resolution", name);
+  if (name) void setResolution(name);
 }
 
 const aspectSteps = computed(() =>

@@ -13,5 +13,16 @@
        gates behind a one-time Downloads-folder prompt. -->
   <key>NSDownloadsFolderUsageDescription</key>
   <string>Luna Ultra Desktop saves the photos and videos you download from your camera into your Downloads folder.</string>
+  <!-- The Gallery/Live View preview loads the camera's media (LRV proxies,
+       stills, the MJPEG/H.264 live feed) directly into <video>/<img> elements
+       over plain HTTP, since the camera itself has no HTTPS. WKWebView's App
+       Transport Security blocks plain HTTP by default; this exception scopes
+       that allowance to local-network addresses only (private IPs, .local
+       hosts) rather than disabling ATS for the whole app. -->
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
 </dict>
 </plist>

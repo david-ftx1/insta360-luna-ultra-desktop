@@ -1,6 +1,8 @@
 import type { CameraInfo, CameraStatus, MediaItem } from "~/types/media";
 import { getCameraTransport } from "~/utils/transport";
 import { armCameraHealth, disarmCameraHealth, FAILURE_THRESHOLD } from "~/utils/cameraHealth";
+import { forgetCachedMedia } from "~/utils/mediaCache";
+import { rawPreviewKey } from "~/utils/rawPreviewCache";
 
 const DEFAULT_HOST = "192.168.42.1";
 const HOST_STORAGE_KEY = "luna-camera-host";
@@ -10,6 +12,7 @@ const RETRY_DELAYS_MS = [1000, 2000, 5000, 10000, 15000];
 
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let networkWatcherInstalled = false;
+let syncingLibrary = false;
 
 export function useCamera() {
   const status = useState<CameraStatus>("camera-status", () => "disconnected");
@@ -192,6 +195,67 @@ export function useCamera() {
     library.value = library.value.filter((item) => !removing.has(item.cameraPath));
   }
 
+  /**
+   * Drop cached thumbnails for files that no longer exist on the camera, by
+   * every cache key a tile could have stored one under (see CameraImage.vue,
+   * VideoThumb.vue, and RawImage.vue/rawPreviewCache.ts for where each key
+   * comes from). Pushing all three per item is harmless — forgetting a key
+   * that was never cached is a no-op — and avoids having to track which
+   * component actually rendered each item.
+   *
+   * Deliberately skips `previewUrl` (the RAW+JPEG sibling-preview case): that
+   * URL is the sibling JPEG's own `srcUrl`, cached under its own `img:` key,
+   * and that sibling MediaItem may still exist independently of this one.
+   */
+  function forgetThumbnails(removed: MediaItem[]) {
+    const keys: string[] = [];
+    for (const item of removed) {
+      keys.push(`img:${item.srcUrl}`);
+      keys.push(`vthumb:${item.srcUrl}`);
+      keys.push(rawPreviewKey(item.srcUrl, { maxBytes: 2_000_000, prefer: "smallest" }));
+    }
+    forgetCachedMedia(keys);
+  }
+
+  /**
+   * Quietly refresh the library against the camera's current file list:
+   * append files that appeared since the last load, and drop (and forget
+   * the thumbnails of) files that no longer exist. Unlike `refreshLibrary`,
+   * this never toggles `loadingLibrary` or surfaces a fetch failure — it's a
+   * background freshness check, not the primary load path, so a slow or
+   * failed round-trip here should be invisible rather than flashing a
+   * skeleton or an error the user didn't ask for.
+   *
+   * Existing item objects are kept (not replaced) for files still present,
+   * so in-place annotations a tile sets once it decodes — `width`/`height`/
+   * `panoramic` (see gallery.vue's `annotateDimensions`) — survive the sync.
+   *
+   * The camera's GET_FILE_LIST protocol has no incremental/delta mode, so
+   * this still re-walks the whole list; "quick" describes the UI behaviour
+   * (no loading flash, no wholesale replace) rather than the network cost.
+   */
+  async function syncLibrary() {
+    if (!isConnected.value || syncingLibrary) return;
+    syncingLibrary = true;
+    try {
+      const fresh = await getCameraTransport().listMedia(host.value);
+      const freshIds = new Set(fresh.map((item) => item.id));
+      const previousById = new Map(library.value.map((item) => [item.id, item]));
+
+      const removed = library.value.filter((item) => !freshIds.has(item.id));
+      const gainedNewItem = fresh.some((item) => !previousById.has(item.id));
+      if (removed.length === 0 && !gainedNewItem) return;
+
+      library.value = fresh.map((item) => previousById.get(item.id) ?? item);
+      if (removed.length > 0) forgetThumbnails(removed);
+    } catch {
+      // Background check — the manual refresh button is still there if the
+      // camera round-trip actually needs retrying.
+    } finally {
+      syncingLibrary = false;
+    }
+  }
+
   return {
     status,
     info,
@@ -205,6 +269,7 @@ export function useCamera() {
     connect,
     disconnect,
     refreshLibrary,
+    syncLibrary,
     removeFromLibrary,
   };
 }

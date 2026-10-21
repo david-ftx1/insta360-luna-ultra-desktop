@@ -21,6 +21,37 @@ const emit = defineEmits<{
 const videoEl = useTemplateRef<HTMLVideoElement>("videoEl");
 
 /**
+ * Prefer the low-res LRV proxy for video preview (fast over the camera's
+ * Wi-Fi), but fall back to the full-resolution file if the proxy fails to
+ * play. WKWebView's AVFoundation-based player is stricter about container
+ * structure than Chromium and can reject some camera-generated .lrv files
+ * outright (verified on-device on macOS: the same clip's full .mp4 plays
+ * fine while its .lrv proxy errors), even though the file downloads and
+ * plays correctly once saved to disk. This mirrors the lrv-then-full
+ * fallback VideoThumb.vue already does for grid thumbnails.
+ */
+const videoFellBackToFull = ref(false);
+
+const videoSrc = computed(() => {
+  if (!props.item) return undefined;
+  if (videoFellBackToFull.value || !props.item.lrvUrl) return props.item.srcUrl;
+  return props.item.lrvUrl;
+});
+
+function onVideoError() {
+  if (!videoFellBackToFull.value && props.item?.lrvUrl) {
+    videoFellBackToFull.value = true;
+  }
+}
+
+watch(
+  () => props.item?.id,
+  () => {
+    videoFellBackToFull.value = false;
+  },
+);
+
+/**
  * Space toggles video play/pause. Captured on window because the modal's focus
  * trap parks focus on a button, where a bubbling handler would either miss the
  * event or let space "click" that button instead. We consume both keydown
@@ -142,10 +173,11 @@ defineShortcuts({
             v-if="item.type === 'video'"
             ref="videoEl"
             :key="item.id"
-            :src="item.lrvUrl ?? item.srcUrl"
+            :src="videoSrc"
             controls
             playsinline
             class="max-h-full max-w-full"
+            @error="onVideoError"
           />
           <PanoViewer
             v-else-if="item.panoramic && item.renderable"

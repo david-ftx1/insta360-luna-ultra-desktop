@@ -8,6 +8,7 @@
   "type": "module",
   "scripts": {
     "build": "tauri build",
+    "build:no-log": "tauri build -- --no-default-features",
     "dev": "tauri dev",
     "ui:dev": "nuxt dev",
     "generate": "nuxt generate",
@@ -24,6 +25,7 @@
     "release": "bun scripts/release.mjs"
   },
   "dependencies": {
+    "@hevcjs/core": "^1.4.8",
     "@iconify-json/lucide": "^1.2.119",
     "@iconify-json/simple-icons": "^1.2.91",
     "@nuxt/ui": "^4.10.0",

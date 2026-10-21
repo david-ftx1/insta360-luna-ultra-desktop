@@ -8,7 +8,7 @@ import { setCameraQueuePaused } from "~/utils/cameraQueue";
 
 useHead({ title: "Gallery" });
 
-const { isConnected, loadingLibrary, refreshLibrary } = useCamera();
+const { isConnected, loadingLibrary, refreshLibrary, syncLibrary } = useCamera();
 const {
   filter,
   storage,
@@ -75,6 +75,15 @@ const previewItem = computed(() =>
 const previewIndex = computed(() =>
   previewId.value ? orderedIds.value.indexOf(previewId.value) : -1,
 );
+
+// Switching to the Gallery tab re-mounts this page (no <KeepAlive> wraps
+// <NuxtPage> in app.vue), so this fires every time the user comes back to
+// it: a quiet re-check for files that appeared or disappeared on the camera
+// since the library was last loaded, without the loading-skeleton flash or
+// error toast a user-initiated refresh would show.
+onMounted(() => {
+  void syncLibrary();
+});
 
 /**
  * Record a photo's real pixel size once it decodes, and promote it to an

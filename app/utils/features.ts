@@ -34,4 +34,29 @@ export const FEATURES = {
    * Both entry points are gated together — leaving one open would defeat it.
    */
   allSettings: false,
+
+  /**
+   * Deep Track overlay — draw a box on the live preview to try the
+   * unconfirmed subject-tracking candidates (TrackingOverlay.vue,
+   * useTracking.ts, utils/trackingCandidates.ts). Unlike allSettings, this
+   * isn't hiding a control that's known to misbehave — it's an openly
+   * experimental probe that labels itself as such everywhere it appears
+   * (the overlay's own readout, every doc comment in trackingCandidates.ts).
+   *
+   * Was `import.meta.dev` — a protocol prober that sends unconfirmed raw
+   * commands to real hardware has no business in a packaged release build,
+   * however harmless it's been so far. Hard-coded to `true` as of
+   * 2026-10-20: David confirmed `tauri build`/`build:no-log` (see
+   * package.json) is now his day-to-day build going forward, not just
+   * `tauri dev --release`, and he wants Deep Track available there too. If
+   * that changes back, flip this to `import.meta.dev` to restore the
+   * dev-only gate, or to `false` to pull it from every build without
+   * removing any files. Still gated at runtime behind its own on/off toggle
+   * in the camera page header either way, so even here it sends nothing
+   * until a person also switches it on. See docs/PROTOCOL-GAP.md's
+   * "Subject tracking" section for what is and isn't known, or delete the
+   * files themselves (trackingCandidates.ts's own comment lists all of
+   * them) if the experiment is abandoned for good.
+   */
+  deepTrackExperiment: true,
 } as const;

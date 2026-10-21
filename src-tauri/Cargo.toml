@@ -20,6 +20,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "LunaUltra"
 path = "src/main.rs"
 
+[features]
+# On by default so the ordinary dev/build commands keep today's behaviour —
+# see lib.rs's own comment on why this plugin registration is unconditional
+# there (`cfg!(debug_assertions)` lied about `tauri dev --release`, so this
+# used to silently never log at all). Build with `--no-default-features`
+# (`bun run build:no-log`, see package.json) for a compile that skips
+# registering the log plugin entirely, so it never creates or writes
+# `~/Library/Logs/com.ripwords.luna-ultra-desktop/Luna Ultra Desktop.log`.
+default = ["debug-log"]
+debug-log = []
+
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
@@ -27,7 +38,16 @@ tauri-build = { version = "2.6.3", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.3", features = [] }
+# "devtools" added 2026-10-19 as a diagnostic aid: Tauri only auto-enables
+# the webview inspector (right-click -> Inspect Element) when
+# `cfg!(debug_assertions)` is true, which `tauri dev --release` does NOT set
+# (it's a release-profile build, just run via the dev command). Without this
+# feature there is no way to see a client-side JS error at all while running
+# `--release` — this project's established practice needs release-mode
+# performance for testing, so the feature has to be explicit instead. Safe to
+# remove once the Camera-tab-does-nothing bug is diagnosed, if the inspector
+# isn't wanted left on.
+tauri = { version = "2.11.3", features = ["devtools"] }
 tauri-plugin-log = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-http = "2"
@@ -37,3 +57,55 @@ tokio = { version = "1", features = ["net", "time", "sync", "io-util", "macros",
 # The auto-updater is a desktop-only concern
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
+
+# Native HEVC decode (see src/hevc_decode.rs) — VideoToolbox is macOS-only,
+# and WKWebView's WebCodecs HEVC refusal that this exists to work around is
+# a macOS-specific restriction in the first place.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-video-toolbox = { version = "0.3", features = [
+  "VTDecompressionSession",
+  "VTErrors",
+  "objc2-core-media",
+  "objc2-core-video",
+] }
+objc2-core-media = { version = "0.3", features = [
+  "CMBase",
+  "CMBlockBuffer",
+  "CMFormatDescription",
+  "CMSampleBuffer",
+  "CMTime",
+] }
+objc2-core-video = { version = "0.3", features = [
+  "CVBase",
+  "CVBuffer",
+  "CVImageBuffer",
+  "CVPixelBuffer",
+  "CVReturn",
+] }
+objc2-core-foundation = { version = "0.3", features = [
+  "CFDictionary",
+  "CFNumber",
+  "CFString",
+  "CFData",
+  # CGSize (used by AVAssetImageGenerator.maximumSize in video_thumbnail.rs)
+  # is re-exported here, gated behind this feature.
+  "CFCGTypes",
+] }
+
+# Native video-thumbnail extraction (see src/video_thumbnail.rs) — AVFoundation
+# decodes the exact same camera file VideoThumb.vue already points a <video>
+# element at, but running natively here means no WKWebView canvas-tainting
+# restriction on reading the decoded pixels back out (see that module's doc
+# comment for the full story).
+objc2-av-foundation = { version = "0.3", features = [
+  "AVAsset",
+  "AVAssetImageGenerator",
+  "objc2-core-media",
+  "objc2-core-graphics",
+  # Needed for AVAssetImageGenerator's maximumSize/setMaximumSize (CGSize is
+  # re-exported from objc2-core-foundation, not objc2-core-graphics).
+  "objc2-core-foundation",
+] }
+objc2-core-graphics = { version = "0.3", features = ["CGImage", "CGGeometry"] }
+objc2-image-io = { version = "0.3", features = ["CGImageDestination", "objc2-core-graphics"] }
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSError"] }

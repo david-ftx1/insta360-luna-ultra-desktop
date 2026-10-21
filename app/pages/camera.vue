@@ -4,13 +4,44 @@ import { FEATURES } from "~/utils/features";
 
 const { isConnected } = useCamera();
 const { device, settings, loading, error, load } = useCameraSettings();
-const { active, starting, error: liveError, diagnostics, start, stop } = useLiveView();
+const { active, starting, error: liveError, start, stop } = useLiveView();
 const { recording, elapsedLabel } = useCameraCapture();
 // Scrolling over the picture is the desktop way to zoom; the dial is a readout
 // you can also drag. Both drive the same gesture state.
 const { onWheel } = useCameraZoom();
+const {
+  enabled: trackingEnabled,
+  toggle: toggleTracking,
+  locked: trackingLocked,
+  cancel: cancelTracking,
+} = useTracking();
+
+/**
+ * REDESIGNED 2026-10-20: one button now does all three jobs David asked
+ * for, instead of this toggle plus TrackingOverlay.vue's own "x" (removed —
+ * see that file's top comment). Off -> on arms the experiment exactly as
+ * `toggleTracking` always did; while armed but not yet locked, clicking
+ * again still gives up the same way. Locked (useTracking.ts's `locked`,
+ * which the button also now colours green for — see the template below) is
+ * the new case: clicking then calls `cancelTracking` instead, releasing the
+ * lock without leaving the experiment armed, so a new box can be drawn
+ * right away without re-enabling first.
+ */
+function handleTrackingClick() {
+  if (trackingLocked.value) {
+    void cancelTracking();
+  } else {
+    void toggleTracking();
+  }
+}
 
 useHead({ title: "Camera" });
+
+/** So TrackingOverlay can map a drawn box back onto the decoded frame's own
+ * resolution instead of this element's CSS size — see LiveView.vue's
+ * getIntrinsicSize comment. Left for Vue to infer from LiveView's own
+ * defineExpose rather than given an explicit (and non-Element) generic. */
+const liveView = useTemplateRef("liveView");
 
 /** The deep settings live in a slide-over, so the viewfinder never scrolls. */
 const settingsOpen = ref(false);
@@ -27,6 +58,19 @@ watch(
   },
   { immediate: true },
 );
+
+/**
+ * MOVED 2026-10-20 (later the same day): the "losing the camera switches
+ * Deep Track off" watcher used to live here. David found it didn't survive
+ * a disconnect done from somewhere other than this page — he confirmed
+ * "disconnect" means the Disconnect button on index.vue/settings.vue, and
+ * this component (and the watch below it was) is unmounted the entire time
+ * someone is sitting on that page, so nothing was listening. It now lives
+ * in useTracking.ts itself, installed once in a detached effect scope that
+ * outlives any one page — see that file's own comment for the full story.
+ * `trackingEnabled` stays imported here only for the navbar button's own
+ * colour, below.
+ */
 
 /**
  * The preview holds the camera's single HTTP connection. Release it *before*
@@ -118,6 +162,15 @@ const topError = computed(() => liveError.value ?? error.value ?? null);
             aria-label="Camera settings"
             @click="settingsOpen = true"
           />
+          <UButton
+            v-if="FEATURES.deepTrackExperiment"
+            icon="i-lucide-scan-face"
+            :color="trackingLocked ? 'success' : trackingEnabled ? 'warning' : 'neutral'"
+            variant="ghost"
+            :disabled="!isConnected"
+            :aria-label="trackingLocked ? 'Cancel Deep Track lock' : 'Deep Track (experimental)'"
+            @click="handleTrackingClick"
+          />
         </template>
       </UDashboardNavbar>
     </template>
@@ -140,7 +193,31 @@ const topError = computed(() => liveError.value ?? error.value ?? null);
       <div v-else class="flex min-h-0 flex-1 flex-col gap-3">
         <!-- Viewfinder: the hero. Everything else floats over it. -->
         <div class="relative min-h-0 flex-1 overflow-hidden rounded-2xl bg-black" @wheel="onWheel">
-          <LiveView class="absolute inset-0" />
+          <LiveView ref="liveView" class="absolute inset-0" />
+
+          <!--
+            Deep Track overlay — experimental, see TrackingOverlay.vue. Sits
+            above everything else in the stage (z-30) so it can capture the
+            drag gesture, but is pointer-events-none and draws nothing of its
+            own when the toggle above is off.
+          -->
+          <TrackingOverlay
+            v-if="FEATURES.deepTrackExperiment"
+            :get-intrinsic-size="() => liveView?.getIntrinsicSize() ?? null"
+            class="absolute inset-0 z-30"
+          />
+
+          <!--
+            Tracking Framing — the 3x3 preset-point picker, shown only while
+            Deep Track is locked. Above the overlay (z-40) but click-through
+            except for its own controls. See TrackingFramingPicker.vue: nothing
+            it picks is sent to the camera yet.
+          -->
+          <TrackingFramingPicker
+            v-if="FEATURES.deepTrackExperiment"
+            :get-intrinsic-size="() => liveView?.getIntrinsicSize() ?? null"
+            class="absolute inset-0 z-40"
+          />
 
           <!-- Starting / stopped state, centred over the black stage -->
           <div
@@ -261,13 +338,6 @@ const topError = computed(() => liveError.value ?? error.value ?? null);
       >
         <template #body>
           <CameraSettings />
-
-          <details v-if="diagnostics.length > 0" class="mt-8 text-sm">
-            <summary class="cursor-pointer text-muted">Live view diagnostics</summary>
-            <pre class="mt-2 overflow-x-auto rounded bg-elevated p-3 text-xs">{{
-              diagnostics.join("\n")
-            }}</pre>
-          </details>
         </template>
       </USlideover>
     </template>

@@ -1,6 +1,6 @@
 import { MSG, isDefaultValue } from "~/utils/lunaProto";
 import { WHITE_BALANCE_KELVIN } from "~/utils/cameraControls";
-import { shutterSeconds } from "~/utils/cameraLabels";
+import { resolutionParts, shutterSeconds } from "~/utils/cameraLabels";
 import type { ProtoObject, ProtoValue } from "~/utils/lunaProto";
 import {
   readDeviceOption,
@@ -149,6 +149,50 @@ export function useCameraSettings() {
 
   const update = (optionType: string, field: string, value: ProtoValue) =>
     writeAndVerify([optionType], { [field]: value }, { option: optionType, field });
+
+  /**
+   * Change `record_resolution`. Confirmed on-device: a same-frame fps change
+   * (e.g. 4K30 -> 4K24) writes cleanly while Live View is streaming, but any
+   * change of frame size — even 4K -> 3K, not just the jump to 8K — comes
+   * back rejected with the camera's own `rejected` echo. Live View's
+   * control-session H.264 stream (`useLiveView`) and this write share the
+   * one TCP session to the camera, and the camera refuses to reconfigure the
+   * sensor readout while that stream is active.
+   *
+   * So a frame-size change pauses Live View around the write and resumes it
+   * afterwards — on either outcome, since the user should get their preview
+   * back whether or not the new resolution took. A same-frame fps change
+   * skips the pause entirely: it already writes live, and stopping the
+   * stream for no reason would flash the preview for nothing.
+   *
+   * Pausing uses `useLiveView().pause()`/`resume()`, not `stop()`/`start()`:
+   * the full stop/start also tells the camera it's leaving and re-entering
+   * camera view, which is what parks and wakes the gimbal — visibly, and for
+   * no reason, since this is the app interrupting its own stream for a
+   * moment, not the user navigating away.
+   */
+  async function setResolution(name: string) {
+    const before = settings.value.record_resolution
+      ? resolutionParts(String(settings.value.record_resolution))
+      : null;
+    const after = resolutionParts(name);
+    const sameFrame =
+      !!before && !!after && before.size === after.size && before.aspect === after.aspect;
+
+    if (sameFrame) {
+      await update("RECORD_RESOLUTION", "record_resolution", name);
+      return;
+    }
+
+    const liveView = useLiveView();
+    const wasActive = liveView.active.value;
+    if (wasActive) await liveView.pause();
+    try {
+      await update("RECORD_RESOLUTION", "record_resolution", name);
+    } finally {
+      if (wasActive) await liveView.resume();
+    }
+  }
 
   /**
    * White balance is two rival fields: the preset enum and a free-Kelvin value
@@ -377,6 +421,7 @@ export function useCameraSettings() {
     status,
     load,
     update,
+    setResolution,
     updateDevice,
     setExposure,
     setWhiteBalance,

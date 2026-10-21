@@ -150,8 +150,30 @@ export const lunaClient = {
     if (isTauri()) await tauriInvoke("luna_liveview_stop");
   },
 
+  /** See CameraTransport.liveViewPause. */
+  async liveViewPause(): Promise<void> {
+    if (isTauri()) await tauriInvoke("luna_liveview_pause");
+  },
+
+  /** See CameraTransport.liveViewResume. */
+  async liveViewResume(): Promise<{ url: string; port: number }> {
+    return tauriInvoke<{ url: string; port: number }>("luna_liveview_resume");
+  },
+
   async liveViewStats(): Promise<LiveViewStats> {
     return tauriInvoke<LiveViewStats>("luna_liveview_stats");
+  },
+
+  /**
+   * Decode one frame near the start of a video file natively (see
+   * `src-tauri/src/video_thumbnail.rs`) and return it as JPEG bytes. `urls`
+   * is tried in order — pass the cheaper LRV proxy before the full file,
+   * same fallback order the grid thumbnail used when it decoded via a
+   * `<video>` element directly.
+   */
+  async videoThumbnail(urls: string[]): Promise<Uint8Array> {
+    const bytes = await tauriInvoke<number[]>("luna_video_thumbnail", { urls });
+    return new Uint8Array(bytes);
   },
 
   /**
@@ -231,5 +253,22 @@ export const lunaClient = {
     if (!isTauri()) return () => {};
     const { listen } = await import("@tauri-apps/api/event");
     return await listen("luna://disconnected", () => handler());
+  },
+
+  /** See CameraTransport.setNotificationCapture. */
+  async setNotificationCapture(enabled: boolean): Promise<void> {
+    if (isTauri()) await tauriInvoke("luna_set_notification_capture", { enabled });
+  },
+
+  /** See CameraTransport.onTrackingNotification. */
+  async onTrackingNotification(
+    handler: (notification: { code: number; requestId: number; bodyHex: string }) => void,
+  ): Promise<() => void> {
+    if (!isTauri()) return () => {};
+    const { listen } = await import("@tauri-apps/api/event");
+    return await listen<{ code: number; requestId: number; bodyHex: string }>(
+      "luna://tracking-notification",
+      (event) => handler(event.payload),
+    );
   },
 };

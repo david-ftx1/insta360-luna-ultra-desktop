@@ -6,7 +6,7 @@
 //!   (consumed from the frontend via the http plugin).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,32 @@ pub(crate) const MEDIA_VIDEO: u8 = 0x20;
 
 pub(crate) const CODE_START_LIVE_STREAM: u16 = 1;
 pub(crate) const CODE_STOP_LIVE_STREAM: u16 = 2;
+/// Two codes with no other documented purpose, found only by correlating
+/// *every* camera-view entry across two independent real captures
+/// (2026-10-16/17, iPhone mirrored over USB via `rvictl`/`rvi0`) against
+/// everything else in the same sessions. Both carry the same tiny body
+/// (wire field 1 = 1, i.e. `08 01`) and neither appears anywhere near
+/// STOP_LIVE_STREAM or during idle polling — only around START.
+/// CODE_UNKNOWN_85 is the stronger signal: it fires exactly twice, within
+/// ~1ms before START_LIVE_STREAM, in all four observed toggles. CODE_UNKNOWN_17
+/// fires once or twice in a less tightly bound window (sometimes ~1s before,
+/// once seen just after). The genuine app sends both every time it enters
+/// camera view; this app currently sends neither.
+pub(crate) const CODE_UNKNOWN_17: u16 = 17;
+pub(crate) const CODE_UNKNOWN_85: u16 = 85;
+/// Found by checking whether this code's *body value* (not just its
+/// presence) tracks camera-view state — it does, cleanly, in both real
+/// captures: body `08 05` (wire field 1 = 5) lands at every START_LIVE_STREAM,
+/// and `08 01` (field 1 = 1) lands right after every STOP_LIVE_STREAM. Earlier
+/// passes wrongly wrote this code off as a generic ~1Hz heartbeat because it
+/// also appears during idle/file-view periods — true, but always with value 1
+/// there, never 5. Unlike CODE_UNKNOWN_17/85 (constant body every time, likely
+/// just UI telemetry), this one's value is the state transition itself, which
+/// is what the two those never could be. Never sent by this app before now.
+pub(crate) const CODE_SET_VIEW_MODE: u16 = 118;
+/// Values observed for CODE_SET_VIEW_MODE's single varint field.
+pub(crate) const VIEW_MODE_FILE: u32 = 1;
+pub(crate) const VIEW_MODE_CAMERA: u32 = 5;
 const CODE_TAKE_PICTURE: u16 = 3;
 const CODE_START_CAPTURE: u16 = 4;
 const CODE_STOP_CAPTURE: u16 = 5;
@@ -45,6 +71,29 @@ const CODE_GET_PHOTOGRAPHY_OPTIONS: u16 = 10;
 const CODE_DELETE_FILES: u16 = 12;
 const CODE_GET_FILE_LIST: u16 = 13;
 const CODE_GET_CURRENT_CAPTURE_STATUS: u16 = 15;
+/// Deep Track / subject-tracking candidates, all UNCONFIRMED — found in
+/// packet captures of the real app turning tracking on and off
+/// (Tracking_Enable_Disable.pcapng, 2026-10-18, and Tracking Data Small.pcapng,
+/// 2026-10-19), not derived from any documented source. 217 (body `08 01`)
+/// is the leading candidate for the enable signal that fires once on
+/// entering a tracking-capable view; 238 (empty body) is the leading
+/// candidate for the "x" tap that ends tracking; 237 (timestamp + x/y/w/h
+/// floats) is a later addition — the only one of the three with a measured
+/// physical correlation so far. See docs/PROTOCOL-GAP.md's "Subject
+/// tracking" section, scripts/probe-tracking.mjs, and
+/// app/utils/trackingCandidates.ts's top comment for the full evidence and
+/// everything tried so far. Allowed here only so the frontend's experimental
+/// overlay (gated behind FEATURES.deepTrackExperiment) can test them against
+/// the real camera from the live view. Remove all three consts and their
+/// is_allowed_command arms below if the experiment is abandoned.
+const CODE_OPEN_TRACKING_CANDIDATE: u16 = 217;
+const CODE_CLOSE_TRACKING_CANDIDATE: u16 = 238;
+const CODE_TRACK_USER_OPS_CANDIDATE: u16 = 237;
+/// 244 — the Tracking Framing "preset tracking point" write (timestamp + x/y/w/h
+/// floats, same layout as 237). Seen once per pick in Tracking_points_Full.pcapng,
+/// 2026-10-21; see app/utils/trackingFraming.ts. Same removal rule as the three
+/// above: const, is_allowed_command arm and test entry go together.
+const CODE_SET_TRACKING_FRAMING_CANDIDATE: u16 = 244;
 
 const CONTROL_PORT: u16 = 6666;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -173,6 +222,23 @@ pub(crate) struct RawResponse {
     body: Vec<u8>,
 }
 
+/// A FILE-type frame whose `request_id` didn't match anything we sent —
+/// i.e. the camera spoke first. Forwarded to the frontend verbatim and only
+/// while `Session::notify_unmatched` is on (see
+/// `luna_set_notification_capture`): see app/composables/useTracking.ts for
+/// why this exists — `CAMERA_NOTIFICATION_TRACK_SYNC` (docs/PROTOCOL-GAP.md)
+/// is the named candidate for the camera pushing its own tracking result
+/// back unprompted, but its numeric code and payload shape are both unknown,
+/// so this is the capture point for finding out empirically whether the
+/// camera sends anything back at all during a live tracking attempt.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UnmatchedNotification {
+    code: u16,
+    request_id: u16,
+    body_hex: String,
+}
+
 /// A parsed UCD2 frame. FILE answers commands, STREAM is the keepalive
 /// echo, and MEDIA carries the live preview substreams.
 #[derive(Debug, Clone)]
@@ -244,6 +310,14 @@ fn drain_frames(buffer: &mut Vec<u8>) -> Vec<Frame> {
         }));
     }
     frames
+}
+
+/// Lowercase-hex-encode a byte slice. Only used for `UnmatchedNotification`'s
+/// `body_hex` — a notification's payload shape is exactly what's unknown
+/// about it, so it crosses the IPC boundary as undecoded hex rather than
+/// something the Rust side would have to guess a struct for.
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn extract_ascii_strings(data: &[u8]) -> Vec<String> {
@@ -331,6 +405,13 @@ pub(crate) struct Session {
     stream_tx: broadcast::Sender<Vec<u8>>,
     /// When a download last received bytes, as reported by `luna_transfer_activity`.
     last_transfer_activity: StdMutex<Option<Instant>>,
+    /// Off by default: an unmatched FILE frame is silently dropped (see the
+    /// reader loop in `open_session`) unless something has explicitly asked
+    /// to see them, via `luna_set_notification_capture`. Keeps this capture
+    /// path — added for the Deep Track experiment — from costing anything
+    /// for every other command the normal request/response path already
+    /// handles.
+    notify_unmatched: AtomicBool,
 }
 
 impl Session {
@@ -354,12 +435,35 @@ impl Session {
         within_transfer_window(*self.last_transfer_activity.lock().unwrap(), Instant::now())
     }
 
+    /// See `Session::notify_unmatched`.
+    fn set_notify_unmatched(&self, enabled: bool) {
+        self.notify_unmatched.store(enabled, Ordering::Relaxed);
+    }
+
     async fn write(&self, packet: &[u8]) -> Result<(), String> {
         let mut writer = self.writer.lock().await;
         writer.write_all(packet).await.map_err(|e| format!("camera write failed: {e}"))
     }
 
-    async fn send_packet(&self, packet: Vec<u8>, request_id: u16, timeout: Duration) -> Result<RawResponse, String> {
+    /// `code`/`body` are only here to log what's actually being sent — see
+    /// 2026-10-20's "luna: send" line below. Added alongside the "matched
+    /// response"/"unmatched frame" logging in the reader loop so a session
+    /// is fully traceable in one place: before this, a miss (code 8315 not
+    /// showing, or "box drawn but tracking didn't start") could only be
+    /// explained from what came *back*, never from whether the expected
+    /// command went *out* at all, with what body, at what request_id. Covers
+    /// every command this app sends — keepalive and device-info probes
+    /// included — not just tracking ones, so the log reads as one real
+    /// timeline instead of a filtered view that could itself hide something.
+    async fn send_packet(
+        &self,
+        packet: Vec<u8>,
+        code: u16,
+        request_id: u16,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<RawResponse, String> {
+        log::info!("luna: send code={code} request_id={request_id} body={}", to_hex(body));
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(request_id, tx);
         if let Err(error) = self.write(&packet).await {
@@ -385,14 +489,14 @@ impl Session {
     pub(crate) async fn send_command(&self, code: u16, body: &[u8], timeout: Duration) -> Result<RawResponse, String> {
         let request_id = self.next_request_id();
         let packet = build_file_command(self.next_seq(), code, request_id, body);
-        self.send_packet(packet, request_id, timeout).await
+        self.send_packet(packet, code, request_id, body, timeout).await
     }
 
     /// Replays a captured command byte-for-byte (fixed seq and request id),
     /// as the original app does during the info handshake.
     async fn send_exact(&self, seq: u8, code: u16, request_id: u16, body: &[u8], timeout: Duration) -> Result<RawResponse, String> {
         let packet = build_file_command(seq, code, request_id, body);
-        self.send_packet(packet, request_id, timeout).await
+        self.send_packet(packet, code, request_id, body, timeout).await
     }
 }
 
@@ -460,9 +564,12 @@ async fn open_session(app: AppHandle, state: Arc<Mutex<Option<Arc<Session>>>>, h
         info: StdMutex::new(LunaDeviceInfo::default()),
         stream_tx: stream_tx.clone(),
         last_transfer_activity: StdMutex::new(None),
+        notify_unmatched: AtomicBool::new(false),
     });
 
     let reader_pending = pending;
+    let reader_notify_unmatched = Arc::clone(&session);
+    let reader_app = app.clone();
     let reader = tokio::spawn(async move {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 16 * 1024];
@@ -474,8 +581,40 @@ async fn open_session(app: AppHandle, state: Arc<Mutex<Option<Arc<Session>>>>, h
                     for frame in drain_frames(&mut buffer) {
                         match frame {
                             Frame::File(response) => {
-                                if let Some(tx) = reader_pending.lock().unwrap().remove(&response.request_id) {
+                                // Logged unconditionally (not just what gets
+                                // forwarded as a notification) — added
+                                // 2026-10-20 to chase down why
+                                // cameraConfirmedTrackingOff missed 1 of 6
+                                // "x" taps with capture left on the whole
+                                // time: this is the only way to tell apart
+                                // "camera didn't send 8315 that time" from
+                                // "it arrived but got silently matched
+                                // against a pending request_id" or "capture
+                                // was somehow off despite the UI state",
+                                // without guessing. See lib.rs for where
+                                // this now actually reaches disk — it never
+                                // did before today under `tauri dev
+                                // --release`.
+                                let code = response.code;
+                                let request_id = response.request_id;
+                                let body_hex = to_hex(&response.body);
+                                if let Some(tx) = reader_pending.lock().unwrap().remove(&request_id) {
+                                    log::info!(
+                                        "luna: matched response code={code} request_id={request_id} body={body_hex}"
+                                    );
                                     let _ = tx.send(response);
+                                } else {
+                                    let capturing =
+                                        reader_notify_unmatched.notify_unmatched.load(Ordering::Relaxed);
+                                    log::info!(
+                                        "luna: unmatched frame code={code} request_id={request_id} body={body_hex} capturing={capturing}"
+                                    );
+                                    if capturing {
+                                        let _ = reader_app.emit(
+                                            "luna://tracking-notification",
+                                            UnmatchedNotification { code, request_id, body_hex },
+                                        );
+                                    }
                                 }
                             }
                             Frame::Media { substream, data }
@@ -597,6 +736,19 @@ pub async fn luna_transfer_activity(state: State<'_, LunaState>) -> Result<(), S
     Ok(())
 }
 
+/// Turn the `luna://tracking-notification` event on or off — see
+/// `Session::notify_unmatched`. A no-op without a session; not an issue in
+/// practice, since the one caller (useTracking.ts's toggle) only runs from
+/// the camera page's header button, which is itself disabled until
+/// connected.
+#[tauri::command]
+pub async fn luna_set_notification_capture(state: State<'_, LunaState>, enabled: bool) -> Result<(), String> {
+    if let Some(session) = state.session.lock().await.as_ref() {
+        session.set_notify_unmatched(enabled);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn luna_delete_files(state: State<'_, LunaState>, paths: Vec<String>) -> Result<(), String> {
     let session = {
@@ -636,6 +788,10 @@ fn is_allowed_command(code: u16) -> bool {
             | CODE_GET_PHOTOGRAPHY_OPTIONS
             | CODE_GET_CURRENT_CAPTURE_STATUS
             | CODE_GET_FILE_LIST
+            | CODE_OPEN_TRACKING_CANDIDATE
+            | CODE_CLOSE_TRACKING_CANDIDATE
+            | CODE_TRACK_USER_OPS_CANDIDATE
+            | CODE_SET_TRACKING_FRAMING_CANDIDATE
     )
 }
 
@@ -737,6 +893,10 @@ mod tests {
             CODE_SET_PHOTOGRAPHY_OPTIONS,
             CODE_GET_PHOTOGRAPHY_OPTIONS,
             CODE_GET_CURRENT_CAPTURE_STATUS,
+            CODE_OPEN_TRACKING_CANDIDATE,
+            CODE_CLOSE_TRACKING_CANDIDATE,
+            CODE_TRACK_USER_OPS_CANDIDATE,
+            CODE_SET_TRACKING_FRAMING_CANDIDATE,
         ] {
             assert!(is_allowed_command(code), "code {code} should be allowed");
         }

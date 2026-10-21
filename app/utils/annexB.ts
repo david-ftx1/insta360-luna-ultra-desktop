@@ -160,11 +160,113 @@ export function buildCodecString(units: Uint8Array[], codec: NalCodec): string |
   return parts.join(".");
 }
 
+/**
+ * Build the HEVCDecoderConfigurationRecord bytes (ISO/IEC 14496-15 §8.3.3.1)
+ * WebCodecs expects as `description` when configuring an "hvc1" decoder
+ * without in-band parameter sets.
+ *
+ * Chromium's HEVC decoder is happy to pick VPS/SPS/PPS out of an Annex-B
+ * stream on its own; Safari's VideoToolbox-backed decoder is not — on
+ * device it rejected `configure()` with a bare codec string outright
+ * ("Config is not valid"), which is what this description is for. Callers
+ * switch to it only after a bare-codec-string `configure()` throws, so
+ * Chromium's existing path is untouched.
+ *
+ * Deliberately minimal: chroma_format_idc and the bit-depth fields are
+ * hardcoded to the common 8-bit 4:2:0 case rather than parsed out of the
+ * SPS (the real values sit several Exp-Golomb fields deeper than the
+ * profile_tier_level this reuses from {@link buildCodecString}). These are
+ * advisory summary fields — VideoToolbox re-derives the real values from
+ * the embedded SPS bytes during decode — so this should hold even if it's
+ * wrong, but revisit here first if 10-bit (Main10) footage ever stops
+ * decoding under the description path specifically.
+ */
+export function buildHevcDescription(units: Uint8Array[]): Uint8Array | null {
+  const vps = units.find((unit) => nalType(unit, "h265") === H265_VPS);
+  const rawSps = findSps(units, "h265");
+  const pps = units.find((unit) => nalType(unit, "h265") === H265_PPS);
+  if (!vps || !rawSps || !pps) return null;
+
+  const sps = unescapeRbsp(rawSps);
+  if (sps.length < 15) return null;
+
+  const header = new Uint8Array(23);
+  header[0] = 1; // configurationVersion
+  header[1] = sps[3]!; // general_profile_space(2) / general_tier_flag(1) / general_profile_idc(5)
+  header.set([sps[4]!, sps[5]!, sps[6]!, sps[7]!], 2); // general_profile_compatibility_flags (32 bits)
+  header.set(sps.subarray(8, 14), 6); // general_constraint_indicator_flags (48 bits)
+  header[12] = sps[14]!; // general_level_idc
+  header[13] = 0xf0; // reserved '1111' + min_spatial_segmentation_idc high nibble (0)
+  header[14] = 0x00; // min_spatial_segmentation_idc low byte
+  header[15] = 0xfc; // reserved '111111' + parallelismType (0, unknown)
+  header[16] = 0xfd; // reserved '111111' + chroma_format_idc (1 = 4:2:0)
+  header[17] = 0xf8; // reserved '11111' + bit_depth_luma_minus8 (0 = 8-bit)
+  header[18] = 0xf8; // reserved '11111' + bit_depth_chroma_minus8 (0 = 8-bit)
+  header[19] = 0x00; // avgFrameRate (unspecified)
+  header[20] = 0x00;
+  header[21] = 0x03; // constantFrameRate(0) numTemporalLayers(0) temporalIdNested(0) lengthSizeMinusOne(3)
+  header[22] = 3; // numOfArrays: VPS, SPS, PPS
+
+  const arrays = [
+    { type: H265_VPS, unit: vps },
+    { type: H265_SPS, unit: rawSps },
+    { type: H265_PPS, unit: pps },
+  ].map(({ type, unit }) => {
+    const out = new Uint8Array(5 + unit.length);
+    out[0] = 0x80 | type; // array_completeness(1)=1, reserved(1)=0, NAL_unit_type(6)
+    out[1] = 0; // numNalus high byte
+    out[2] = 1; // numNalus low byte — one NAL per parameter-set type
+    out[3] = (unit.length >> 8) & 0xff; // nalUnitLength high byte
+    out[4] = unit.length & 0xff; // nalUnitLength low byte
+    out.set(unit, 5);
+    return out;
+  });
+
+  const record = new Uint8Array(header.length + arrays.reduce((n, a) => n + a.length, 0));
+  record.set(header, 0);
+  let at = header.length;
+  for (const array of arrays) {
+    record.set(array, at);
+    at += array.length;
+  }
+  return record;
+}
+
 const isVcl = (type: number, codec: NalCodec) =>
   codec === "h265" ? type <= H265_VCL_MAX : type === H264_IDR || type === H264_NON_IDR;
 
 const isKeyNal = (type: number, codec: NalCodec) =>
   codec === "h265" ? type >= H265_IRAP_MIN && type <= H265_IRAP_MAX : type === H264_IDR;
+
+/**
+ * How an access unit's NAL units are packed into the `data` WebCodecs
+ * decodes. "annexb" (start-code-prefixed, parameter sets in-band) is what
+ * Chromium's HEVC decoder accepts from a bare codec string. "length4"
+ * (4-byte big-endian length prefixes, no start codes, no in-band parameter
+ * sets) is what a decoder configured with an explicit `description` expects
+ * — required by Safari. See {@link buildHevcDescription}.
+ */
+export type NalFraming = "annexb" | "length4";
+
+function packedSize(unit: Uint8Array, framing: NalFraming): number {
+  return (framing === "annexb" ? START_CODE.length : 4) + unit.length;
+}
+
+/** Write one NAL unit into `out` at `at`, framed per `framing`; returns the next offset. */
+function packNal(unit: Uint8Array, framing: NalFraming, out: Uint8Array, at: number): number {
+  if (framing === "annexb") {
+    out.set(START_CODE, at);
+    out.set(unit, at + START_CODE.length);
+    return at + START_CODE.length + unit.length;
+  }
+  const { length } = unit;
+  out[at] = (length >>> 24) & 0xff;
+  out[at + 1] = (length >>> 16) & 0xff;
+  out[at + 2] = (length >>> 8) & 0xff;
+  out[at + 3] = length & 0xff;
+  out.set(unit, at + 4);
+  return at + 4 + length;
+}
 
 /**
  * A new access unit begins at the first slice of a picture. H.265 signals
@@ -191,6 +293,7 @@ function startsPicture(unit: Uint8Array, codec: NalCodec): boolean {
 export function drainAccessUnits(
   units: Uint8Array[],
   codec: NalCodec,
+  framing: NalFraming = "annexb",
 ): { access: AccessUnit[]; pending: Uint8Array[] } {
   const pictureStarts: number[] = [];
   for (let i = 0; i < units.length; i++) {
@@ -206,17 +309,28 @@ export function drainAccessUnits(
   while (from > 0 && !isVcl(nalType(units[from - 1]!, codec), codec)) from--;
 
   return {
-    access: groupAccessUnits(units.slice(0, from), codec),
+    access: groupAccessUnits(units.slice(0, from), codec, framing),
     pending: units.slice(from),
   };
 }
 
 /**
- * Group NAL units into decodable access units, re-adding start codes.
- * Leading parameter sets are carried into the access unit that follows them,
- * which is what lets the decoder configure itself from the first keyframe.
+ * Group NAL units into decodable access units.
+ *
+ * In "annexb" framing (the default), start codes are re-added and leading
+ * parameter sets are carried into the access unit that follows them, which
+ * is what lets a decoder configured from a bare codec string pick them up
+ * from the first keyframe. In "length4" framing — used once a decoder has
+ * been configured with an explicit {@link buildHevcDescription} — parameter
+ * sets live only in that description, so they are dropped here rather than
+ * mixed into sample data the decoder isn't expecting them in, and each VCL
+ * NAL gets a 4-byte length prefix instead of a start code.
  */
-export function groupAccessUnits(units: Uint8Array[], codec: NalCodec): AccessUnit[] {
+export function groupAccessUnits(
+  units: Uint8Array[],
+  codec: NalCodec,
+  framing: NalFraming = "annexb",
+): AccessUnit[] {
   const access: AccessUnit[] = [];
   let pending: Uint8Array[] = [];
   let key = false;
@@ -224,15 +338,12 @@ export function groupAccessUnits(units: Uint8Array[], codec: NalCodec): AccessUn
 
   const flush = () => {
     if (!seenVcl || pending.length === 0) return;
-    const size = pending.reduce((total, unit) => total + START_CODE.length + unit.length, 0);
+    const toPack =
+      framing === "annexb" ? pending : pending.filter((u) => isVcl(nalType(u, codec), codec));
+    const size = toPack.reduce((total, unit) => total + packedSize(unit, framing), 0);
     const data = new Uint8Array(size);
     let at = 0;
-    for (const unit of pending) {
-      data.set(START_CODE, at);
-      at += START_CODE.length;
-      data.set(unit, at);
-      at += unit.length;
-    }
+    for (const unit of toPack) at = packNal(unit, framing, data, at);
     access.push({ key, data });
     pending = [];
     key = false;

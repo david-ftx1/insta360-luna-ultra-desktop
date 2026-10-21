@@ -20,6 +20,14 @@
       "rules": {
         "no-restricted-imports": "off"
       }
+    },
+    {
+      "files": ["public/hevc/**"],
+      "rules": {
+        "no-unused-vars": "off",
+        "no-unassigned-vars": "off",
+        "getter-return": "off"
+      }
     }
   ]
 }
