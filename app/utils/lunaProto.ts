@@ -91,6 +91,11 @@ function toNumber(spec: FieldSpec, value: ProtoValue): number {
   if (spec.type === "bool") return value ? 1 : 0;
   if (spec.type === "enum") {
     if (typeof value === "number") return value;
+    // A bare number ("22") goes out as that number. The camera uses values the
+    // vendored schema has never heard of (Stage Mode: video_sub_mode 22,
+    // function mode 68, capture mode 15 — all seen in a capture, 2026-10-21),
+    // and decoding already hands such values back as plain numbers.
+    if (/^\d+$/.test(String(value))) return Number(value);
     const resolved = enumValue(spec.ref ?? "", String(value));
     if (resolved === null) throw new Error(`unknown enum value ${String(value)} for ${spec.name}`);
     return resolved;

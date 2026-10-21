@@ -18,7 +18,7 @@
  * photo_sub_mode = 8, which the schema cannot name, so guessing at these would
  * be inventing numbers. Measure them with probe-colorspace.mjs before adding.
  */
-export type CaptureModeId = "video" | "pure" | "slowmo" | "photo" | "pano" | "timelapse";
+export type CaptureModeId = "video" | "pure" | "stage" | "slowmo" | "photo" | "pano" | "timelapse";
 
 export interface CameraMode {
   id: CaptureModeId;
@@ -51,6 +51,27 @@ export const CAPTURE_MODES: CameraMode[] = [
     subMode: "VIDEO_PURE",
     functionMode: "FUNCTION_MODE_NORMAL_VIDEO",
     captureMode: "Capture_MODE_PURE_VIDEO",
+  },
+  /**
+   * Stage Mode (up to 15x zoom), added 2026-10-21 from a capture of the iPhone
+   * app selecting it and recording (docs/STAGE-MODE-CAPTURE.md). All three
+   * numbers are outside the vendored schema, so they are written as plain
+   * numbers (see toNumber in lunaProto.ts):
+   * - video_sub_mode 22   — the set-options write sent when Stage Mode is picked
+   * - function mode 68    — what the app then reads its photography options under
+   * - capture mode 15     — in both start (code 4) and stop (code 5) recording
+   * Not yet confirmed from THIS app: that the camera accepts the same writes
+   * from us, that a stop without the phone's extra metadata is accepted, and
+   * that zoom behaves under function mode 68.
+   */
+  {
+    id: "stage",
+    label: "Stage Mode",
+    optionType: "VIDEO_SUB_MODE",
+    field: "video_sub_mode",
+    subMode: "22",
+    functionMode: "68",
+    captureMode: "15",
   },
   {
     id: "slowmo",
