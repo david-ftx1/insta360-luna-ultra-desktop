@@ -94,6 +94,11 @@ const CODE_TRACK_USER_OPS_CANDIDATE: u16 = 237;
 /// 2026-10-21; see app/utils/trackingFraming.ts. Same removal rule as the three
 /// above: const, is_allowed_command arm and test entry go together.
 const CODE_SET_TRACKING_FRAMING_CANDIDATE: u16 = 244;
+/// 226 — the gimbal joystick: stick position while held (`08 01 12 .. 20 04`) and
+/// recentre (`08 02 12 00`). Seen in JoystickandFocus.pcapng, 2026-10-22; see
+/// app/utils/gimbalControl.ts. The same message the iPhone app sends, so it moves
+/// the physical gimbal — allowed for the camera page's joystick only.
+const CODE_GIMBAL_JOYSTICK: u16 = 226;
 
 const CONTROL_PORT: u16 = 6666;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -792,6 +797,7 @@ fn is_allowed_command(code: u16) -> bool {
             | CODE_CLOSE_TRACKING_CANDIDATE
             | CODE_TRACK_USER_OPS_CANDIDATE
             | CODE_SET_TRACKING_FRAMING_CANDIDATE
+            | CODE_GIMBAL_JOYSTICK
     )
 }
 
@@ -897,6 +903,7 @@ mod tests {
             CODE_CLOSE_TRACKING_CANDIDATE,
             CODE_TRACK_USER_OPS_CANDIDATE,
             CODE_SET_TRACKING_FRAMING_CANDIDATE,
+            CODE_GIMBAL_JOYSTICK,
         ] {
             assert!(is_allowed_command(code), "code {code} should be allowed");
         }

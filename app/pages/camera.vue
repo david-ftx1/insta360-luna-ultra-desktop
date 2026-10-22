@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { optionLabel } from "~/utils/cameraLabels";
 import { FEATURES } from "~/utils/features";
+import { containRect } from "~/utils/trackingFraming";
 
 const { isConnected } = useCamera();
 const { device, settings, loading, error, load } = useCameraSettings();
@@ -14,7 +15,34 @@ const {
   toggle: toggleTracking,
   locked: trackingLocked,
   cancel: cancelTracking,
+  framingPickerOpen,
 } = useTracking();
+
+/**
+ * Gimbal joystick (switch in the header, arrow keys, on-screen stick, recentre)
+ * and double-click-to-focus, added 2026-10-22 — see app/utils/gimbalControl.ts.
+ */
+const {
+  enabled: joystickEnabled,
+  toggle: toggleJoystick,
+  onKeyDown,
+  onKeyUp,
+  releaseAll: releaseJoystick,
+} = useGimbalJoystick();
+const { focusAt } = useTapFocus();
+
+onMounted(() => {
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
+  window.addEventListener("blur", releaseJoystick);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKeyDown);
+  window.removeEventListener("keyup", onKeyUp);
+  window.removeEventListener("blur", releaseJoystick);
+  releaseJoystick();
+});
 
 /**
  * REDESIGNED 2026-10-20: one button now does all three jobs David asked
@@ -42,6 +70,32 @@ useHead({ title: "Camera" });
  * getIntrinsicSize comment. Left for Vue to infer from LiveView's own
  * defineExpose rather than given an explicit (and non-Element) generic. */
 const liveView = useTemplateRef("liveView");
+
+/**
+ * Double-click anywhere on the picture to focus there. Clicks on the controls
+ * laid over it (buttons, the zoom dial, the bottom bar — marked `data-no-focus`)
+ * and on the letterbox bars are ignored, and so is any click while the Tracking
+ * Framing picker is open.
+ */
+function onStageDoubleClick(event: MouseEvent) {
+  if (!active.value || framingPickerOpen.value) return;
+  const target = event.target;
+  if (
+    target instanceof Element &&
+    target.closest("button, a, input, select, textarea, [data-no-focus]")
+  )
+    return;
+  const stage = event.currentTarget;
+  if (!(stage instanceof HTMLElement)) return;
+  const box = stage.getBoundingClientRect();
+  const frame = liveView.value?.getIntrinsicSize() ?? null;
+  const content = frame ? containRect(box.width, box.height, frame.width, frame.height) : null;
+  const area = content ?? { left: 0, top: 0, width: box.width, height: box.height };
+  const x = (event.clientX - box.left - area.left) / area.width;
+  const y = (event.clientY - box.top - area.top) / area.height;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return;
+  focusAt(x, y);
+}
 
 /** The deep settings live in a slide-over, so the viewfinder never scrolls. */
 const settingsOpen = ref(false);
@@ -163,6 +217,21 @@ const topError = computed(() => liveError.value ?? error.value ?? null);
             @click="settingsOpen = true"
           />
           <UButton
+            icon="i-lucide-gamepad-2"
+            :color="joystickEnabled ? 'success' : 'neutral'"
+            variant="ghost"
+            :disabled="!isConnected"
+            :aria-label="
+              joystickEnabled ? 'Switch off gimbal joystick' : 'Switch on gimbal joystick'
+            "
+            :title="
+              joystickEnabled
+                ? 'Gimbal joystick on — arrow keys move the gimbal'
+                : 'Gimbal joystick'
+            "
+            @click="toggleJoystick"
+          />
+          <UButton
             v-if="FEATURES.deepTrackExperiment"
             icon="i-lucide-scan-face"
             :color="trackingLocked ? 'success' : trackingEnabled ? 'warning' : 'neutral'"
@@ -192,7 +261,11 @@ const topError = computed(() => liveError.value ?? error.value ?? null);
 
       <div v-else class="flex min-h-0 flex-1 flex-col gap-3">
         <!-- Viewfinder: the hero. Everything else floats over it. -->
-        <div class="relative min-h-0 flex-1 overflow-hidden rounded-2xl bg-black" @wheel="onWheel">
+        <div
+          class="relative min-h-0 flex-1 overflow-hidden rounded-2xl bg-black"
+          @wheel="onWheel"
+          @dblclick="onStageDoubleClick"
+        >
           <LiveView ref="liveView" class="absolute inset-0" />
 
           <!--
@@ -213,6 +286,12 @@ const topError = computed(() => liveError.value ?? error.value ?? null);
             except for its own controls. See TrackingFramingPicker.vue: nothing
             it picks is sent to the camera yet.
           -->
+          <!-- Yellow box where the camera was last asked to focus -->
+          <FocusBox
+            :get-intrinsic-size="() => liveView?.getIntrinsicSize() ?? null"
+            class="absolute inset-0 z-30"
+          />
+
           <TrackingFramingPicker
             v-if="FEATURES.deepTrackExperiment"
             :get-intrinsic-size="() => liveView?.getIntrinsicSize() ?? null"
@@ -304,9 +383,12 @@ const topError = computed(() => liveError.value ?? error.value ?? null);
             The zoom dial hugs the right edge, clear of the readout rail above
             and the pro bar below, so a drag never lands on another control.
           -->
-          <div class="absolute inset-y-20 right-2 z-20 flex items-center">
+          <div class="absolute inset-y-20 right-2 z-20 flex items-center" data-no-focus>
             <CameraZoomDial />
           </div>
+
+          <!-- Gimbal: recentre button, and the stick while the joystick is on -->
+          <GimbalJoystickPad />
 
           <!-- Errors sit below the readout rail, so neither ever moves -->
           <div v-if="topError" class="absolute inset-x-0 top-14 z-20 flex justify-center px-4">
@@ -321,6 +403,7 @@ const topError = computed(() => liveError.value ?? error.value ?? null);
           <!-- Quick exposure bar + gear, along the bottom of the viewfinder -->
           <div
             class="absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-black/70 via-black/40 to-transparent p-2 pr-12 pt-10"
+            data-no-focus
           >
             <CameraProBar @open-settings="settingsOpen = true" />
           </div>
